@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Gemini Live Direct</title>
+    <style>
+        body { margin: 0; background: #050510; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
+        h1 { color: #3b82f6; text-shadow: 0 0 10px #3b82f6; }
+        #status { margin-top: 20px; font-size: 18px; color: #aaa; }
+        button { margin-top: 30px; padding: 15px 30px; font-size: 18px; background: #3b82f6; color: white; border: none; border-radius: 10px; cursor: pointer; }
+        button:active { transform: scale(0.95); }
+    </style>
+</head>
+<body>
+    <h1>FOX LIVE</h1>
+    <div id="status">اضغط للبدء</div>
+    <button id="startBtn">تشغيل المايك</button>
+
+    <script>
+        // ضع مفتاح AQ هنا
+        const API_KEY = "ضع_المفتاح_هنا_بدون_كلمة_sk"; 
+        let audioContext, mediaStream, workletNode;
+        let socket;
+
+        document.getElementById('startBtn').onclick = async () => {
+            const status = document.getElementById('status');
+            status.innerText = "جاري الاتصال...";
+            
+            try {
+                // نطلب المايك
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                
+                // الاتصال المباشر بسيرفر جوجل
+                const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${API_KEY}`;
+                socket = new WebSocket(url);
+
+                socket.onopen = () => {
+                    status.innerText = "متصل.. جاري التهيئة";
+                    // إعداد الجلسة
+                    socket.send(JSON.stringify({
+                        setup: {
+                            model: "models/gemini-2.0-flash-exp",
+                            generationConfig: {
+                                responseModalities: ["AUDIO"]
+                            },
+                            systemInstruction: {
+                                parts: [{ text: "أنت مساعد ذكي. رد بسرعة جداً وباللغة العربية." }]
+                            }
+                        }
+                    }));
+                    
+                    // بدء تسجيل الصوت
+                    startAudioRecording();
+                };
+
+                socket.onmessage = async (event) => {
+                    const data = JSON.parse(event.data);
+                    if (data.serverContent && data.serverContent.modelTurn && data.serverContent.modelTurn.parts) {
+                        for (let part of data.serverContent.modelTurn.parts) {
+                            if (part.inlineData && part.inlineData.mimeType.startsWith('audio/')) {
+                                playAudio(part.inlineData.data);
+                            }
+                        }
+                    }
+                };
+
+                socket.onerror = (e) => {
+                    status.innerText = "خطأ في الاتصال.";
+                    console.error(e);
+                };
+
+            } catch (e) {
+                status.innerText = "فشل المايك: " + e.message;
+            }
+        };
+
+        async function startAudioRecording() {
+            document.getElementById('status').innerText = "أنا أسمعك...";
+            
+            await audioContext.audioWorklet.addModule('data:application/javascript;base64,' + btoa(`
+                class RecorderProcessor extends AudioWorkletProcessor {
+                    process(inputs, outputs, parameters) {
+                        const input = inputs[0];
+                        if (input.length > 0) {
+                            const channelData = input[0];
+                            this.port.postMessage(channelData);
+                        }
+                        return true;
+                    }
+                }
+                registerProcessor('recorder-processor', RecorderProcessor);
+            `));
+
+            const source = audioContext.createMediaStreamSource(mediaStream);
+            workletNode = new AudioWorkletNode(audioContext, 'recorder-processor');
+            source.connect(workletNode);
+
+            workletNode.port.onmessage = (e) => {
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    const float32Data = e.data;
+                    const int16Data = new Int16Array(float32Data.length);
+                    for (let i = 0; i < float32Data.length; i++) {
+                        int16Data[i] = Math.max(-1, Math.min(1, float32Data[i])) * 0x7FFF;
+                    }
+                    // تحويل لـ Base64
+                    const base64 = btoa(String.fromCharCode(...new Uint8Array(int16Data.buffer)));
+                    socket.send(JSON.stringify({
+                        realtimeInput: {
+                            mediaChunks: [{
+                                mimeType: "audio/pcm;rate=16000",
+                                data: base64
+                            }]
+                        }
+                    }));
+                }
+            };
+        }
+
+        function playAudio(base64) {
+            const binary = atob(base64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            const int16 = new Int16Array(bytes.buffer);
+            const float32 = new Float32Array(int16.length);
+            for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
+
+            const buffer = audioContext.createBuffer(1, float32.length, 24000);
+            buffer.getChannelData(0).set(float32);
+            
+            const source = audioContext.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioContext.destination);
+            source.start();
+        }
+    </script>
+</body>
+</html>
